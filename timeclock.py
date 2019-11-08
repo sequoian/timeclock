@@ -1,141 +1,131 @@
-import sys
-import time
-from datetime import datetime, timedelta
-from threading import Thread
-from PySide2 import QtCore, QtWidgets, QtGui
 import sqlite3
+import argparse
+from datetime import datetime
+from tabulate import tabulate
 
-def strfdelta(seconds):
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-    return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
-
-def getElapsed(after, before):
-    elapsed = after - before
-    return int(timedelta(seconds=elapsed).total_seconds())
-
-class TimeClock(QtWidgets.QWidget):
+class Timeclock:
     def __init__(self):
-        super().__init__()
+        self.db = Database("time.db")
 
-        self.setWindowTitle("Timeclock")
+    def clock_in(self, args):
+        latest_shift = self.get_latest_shift()
+        now = datetime.now()
+        if self.can_clock_in(latest_shift):
+            self.db.clock_in(int(now.timestamp()))
+            print("Clocked in at {}".format(self.format_time(now)))
+        else:
+            delta = now - datetime.fromtimestamp(latest_shift[1])
+            print("Already clocked in for {}".format(self.format_delta_seconds(int(delta.total_seconds()))))
 
-        # data
-        self.clockedin = False
-        self.intime = None
-        self.outtime = None
-        self.rowid = None
-        self.tabledata = []
+    def clock_out(self, args):
+        latest_shift = self.get_latest_shift()
+        if self.can_clock_in(latest_shift):
+            print("Not clocked in")
+        else:
+            now = datetime.now()
+            delta = now - datetime.fromtimestamp(latest_shift[1])
+            self.db.clock_out(latest_shift[0], int(now.timestamp()))
+            print("Clocked out at {}, worked for {}".format(
+                  self.format_time(now), self.format_delta_seconds(int(delta.total_seconds()))))
 
-        # thread
-        self.clock = Thread(target=self.tick, daemon=True)
+    def list_shifts(self, args):
+        rows = self.db.get_latest_shifts(args.limit)
+        if rows:
+            self.tabulate_shifts(rows)
+        else:
+            print("No shifts worked")
 
-        # widgets
-        self.button = QtWidgets.QPushButton("Clock In")
-        self.text = QtWidgets.QLabel("00:00:00")
-        self.text.setAlignment(QtCore.Qt.AlignCenter)
-        self.table = QtWidgets.QTableWidget(40, 4)
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().hide()
-        self.table.setItem(1, 1, QtWidgets.QTableWidgetItem("Hello"))
+    def show_status(self, args):
+        latest_shift = self.get_latest_shift()
+        if self.can_clock_in(latest_shift):
+            print("Currently clocked out")
+        else:
+            delta = datetime.now() - datetime.fromtimestamp(latest_shift[1])
+            print("Currently clocked in for {}".format(self.format_delta_seconds(int(delta.total_seconds()))))
 
-        # layouts
-        self.layout = QtWidgets.QHBoxLayout()
-        self.layout.addWidget(self.button)
-        self.layout.addWidget(self.text)
-        self.layout2 = QtWidgets.QVBoxLayout()
-        self.layout2.addLayout(self.layout)
-        self.layout2.addWidget(self.table)
-        self.setLayout(self.layout2)
+    def show_today(self, args):
+        shifts = self.db.get_shifts_today()
+        duration = 0
+        for shift in shifts:
+            if not shift[2]:
+                duration += datetime.now().timestamp() - shift[1]
+            else:
+                duration += shift[2] - shift[1]
+        print("------------------------")
+        print("Worked today for {}".format(self.format_delta_seconds(int(duration))))
+        print("------------------------")
 
-        # connections
-        self.button.clicked.connect(self.buttonPress)
+        if shifts:
+            self.tabulate_shifts(shifts)
 
-        # query database
-        self.db = Database()
-        self.tabledata = self.db.getLatestShifts()
+    def get_latest_shift(self):
+        latest_shift = self.db.get_latest_shifts(1)
+        if not latest_shift:
+            return None
+        else:
+            return latest_shift[0]
 
-        # check if shift is in progress
+    def can_clock_in(self, latest_shift):
+        if not latest_shift or latest_shift[2] != None:
+            return True
+        else:
+            return False
+
+    def format_time(self, datetime):
+        return datetime.strftime("%I:%M %p")
+
+    def format_delta_seconds(self, seconds):
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        return "{}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+    def tabulate_shifts(self, rows):
+        table = list()
+        for row in rows:
+            shift = list()
+            time = datetime.fromtimestamp(row[1])
+            shift.append(time.strftime("%x"))
+            shift.append(self.format_time(time))
+            if row[2]:
+                shift.append(self.format_time(datetime.fromtimestamp(row[2])))
+                seconds = row[2] - row[1]
+                shift.append(self.format_delta_seconds(seconds))
+            else:
+                shift.append('')
+                shift.append('')
+            table.append(shift)
+        
+        headers = ["Day", "In", "Out", "Time"]
+        print(tabulate(table, headers))
+
+    def run(self):
+        """ Run the application """
+        # Configure argument parser
+        parser = argparse.ArgumentParser(prog="clock")
+        subparsers = parser.add_subparsers()
+        clock_in = subparsers.add_parser("in")
+        clock_in.set_defaults(func=self.clock_in)
+        clock_out = subparsers.add_parser("out")
+        clock_out.set_defaults(func=self.clock_out)
+        status = subparsers.add_parser("status")
+        status.set_defaults(func=self.show_status)
+        listing = subparsers.add_parser("list")
+        listing.add_argument("limit", type=int, default=10, nargs="?")
+        listing.set_defaults(func=self.list_shifts)
+        today = subparsers.add_parser("today")
+        today.set_defaults(func=self.show_today)
+
+        args = parser.parse_args()
+
         try:
-            latest = self.tabledata[0]
-            if latest[2] is None:
-                self.clockedin = True
-                self.rowid = latest[0]
-                self.intime = latest[1]
-                self.button.setText("Clock Out")
-                self.clock.start()
-        except IndexError:
-            pass
+            args.func(args)
+        except AttributeError:
+            parser.print_usage()
 
-        self.button.setShortcut(QtGui.QKeySequence(QtCore.Qt.Key_C))
-        self.renderTable()
-        
-    def buttonPress(self):
-        self.clockedin = False if self.clockedin else True
-        self.clockin() if self.clockedin else self.clockout()
-
-        self.button.setText("Clock Out" if self.clockedin else "Clock In")
-
-        # need to reset shortcut after text change
-        self.button.setShortcut(QtGui.QKeySequence(QtCore.Qt.Key_C))
-
-    def clockin(self):
-        self.intime = time.time()
-        self.rowid = self.db.clockin(int(self.intime))
-        self.clock.start()
-        self.tabledata.insert(0, (self.rowid, int(self.intime), None))
-        self.renderTable()
-
-    def clockout(self):
-        self.outtime = time.time()
-        self.db.clockout(self.rowid, int(self.outtime))
-        self.tabledata[0] = (self.rowid, int(self.intime), int(self.outtime))
-        self.renderTable()
-        self.intime = None
-        self.rowid = None
-        self.text.setText("00:00:00")
-        
-        # Create a new thread since threads can only be started once
-        self.clock = Thread(target=self.tick, daemon=True)
-
-    def tick(self):
-        while (self.clockedin):
-            elapsed = getElapsed(time.time(), self.intime)
-            self.text.setText(strfdelta(elapsed))
-            time.sleep(1) 
-
-    def renderTable(self):
-        self.table.setRowCount(len(self.tabledata)+1)
-
-        # print header
-        self.table.setItem(0, 0, QtWidgets.QTableWidgetItem("Day"))
-        self.table.setItem(0, 1, QtWidgets.QTableWidgetItem("In"))
-        self.table.setItem(0, 2, QtWidgets.QTableWidgetItem("Out"))
-        self.table.setItem(0, 3, QtWidgets.QTableWidgetItem("Time"))
-
-        # print self.tabledata
-        for num, shift in enumerate(self.tabledata):
-            inday = datetime.fromtimestamp(shift[1]).strftime("%x")
-            intime = datetime.fromtimestamp(shift[1]).strftime("%I:%M:%S %p")
-            try:
-                outtime = datetime.fromtimestamp(shift[2]).strftime("%I:%M:%S %p")
-                elapsed = getElapsed(shift[2], shift[1])
-                elapsed = strfdelta(elapsed)
-            except TypeError:
-                outtime = ""
-                elapsed = ""
-            
-            self.table.setItem(num+1, 0, QtWidgets.QTableWidgetItem(inday))
-            self.table.setItem(num+1, 1, QtWidgets.QTableWidgetItem(intime))
-            self.table.setItem(num+1, 2, QtWidgets.QTableWidgetItem(outtime))
-            self.table.setItem(num+1, 3, QtWidgets.QTableWidgetItem(elapsed))
-
-        self.table.resizeColumnsToContents()
 
 class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect("test.db")
+    def __init__(self, dbpath):
+        self.conn = sqlite3.connect(dbpath)
         self.cursor = self.conn.cursor()
 
         # Create the tables if they don't exist
@@ -148,28 +138,30 @@ class Database:
             """
         self.cursor.execute(createtable)
 
-    def clockin(self, intime):
+    def clock_in(self, intime):
         sql = "INSERT INTO shifts (cin) VALUES (?)"
         self.cursor.execute(sql, (intime,))
         self.conn.commit()
         return self.cursor.lastrowid
 
-    def clockout(self, uid, outtime):
+    def clock_out(self, uid, outtime):
         sql = "UPDATE shifts SET cout = ? WHERE id = ?"
         self.cursor.execute(sql, (outtime, uid))
         self.conn.commit()
     
-    def getLatestShifts(self, limit=40):
+    def get_latest_shifts(self, limit=40):
         sql = "SELECT * FROM shifts ORDER BY cin DESC LIMIT ?"
         self.cursor.execute(sql, (limit,))
         return self.cursor.fetchall()
 
+    def get_shifts_today(self):
+        start_of_day = int(datetime.now().replace(hour=0, minute=0, 
+                           second=0, microsecond=0).timestamp())
+        sql = "SELECT * FROM shifts WHERE cin >= ? ORDER BY cin DESC"
+        self.cursor.execute(sql, (start_of_day,))
+        return self.cursor.fetchall()
+
 
 if __name__ == "__main__":
-    app = QtWidgets.QApplication([])
-
-    widget = TimeClock()
-    widget.resize(300, 250)
-    widget.show()
-
-    sys.exit(app.exec_())
+    app = Timeclock()
+    app.run()
